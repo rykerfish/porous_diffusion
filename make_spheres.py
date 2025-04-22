@@ -7,15 +7,23 @@ import utils
 from numba import njit, prange
 from libMobility import PSE
 
+fname = "colloid_pos.csv"
 
 def main():
-    sphere_radius = 100e-6  # m
-    rigid_blob_x0, n_spheres, sphere_centers, blob_radius = make_spheres(sphere_radius)
-    L = 4.32 * 2 * sphere_radius  # TODO check value, should probably come from a file
+    sphere_radius = 100  # um
+    in_file = "dat/small.xyzd"
+    rigid_blob_x0, n_spheres, sphere_centers, blob_radius = make_spheres(
+        sphere_radius, in_file
+    )
+    L = (
+        4.32 * 2 * sphere_radius
+    )  # TODO should probably come from the sphere positions file
     Lx, Ly, Lz = L, L, L
     L_arr = np.array([Lx, Ly, Lz])
     n_rigid_blobs = rigid_blob_x0.shape[0] // 3
+    rigid_blob_x0 = np.reshape(rigid_blob_x0, (n_rigid_blobs, 3))
 
+    print("L:", L)
     print("n_rigid_blobs:", n_rigid_blobs)
     print("blob size:", blob_radius)
     print("this should be close to the blob radius:", sphere_radius / 20)
@@ -28,106 +36,152 @@ def main():
 
     all_pos = np.append(rigid_blob_x0, colloid_pos)
     n_blobs = np.shape(all_pos)[0] // 3
+    all_pos = np.reshape(all_pos, (n_blobs, 3))
+    x0 = all_pos.copy()
     print("n blobs:", n_blobs)
 
-    kbt = 4.11e-21  # J
+    kbt = 0.004  # aJ
     eta = 1.0e-3  # Pa.s
     solver = utils.init_solver(n_blobs, Lx, Ly, Lz, kbt, eta, blob_radius, "PSE")
     precision = np.float32 if PSE.precision == "float" else np.float64
 
-    k_spring = 1e6 * kbt
+    k_spring = 1e2 * kbt / (blob_radius**2)
     U0 = 4 * kbt
     debye = 0.1 * blob_radius
+    n_cutoff = 5  # number of debye lengths to include in the cutoff
+    r_cut = (
+        2 * blob_radius + n_cutoff * debye
+    )  # TODO check value of sterics at cutoff distance
 
-    # forces = np.random.rand(n_blobs * 3) - 0.5
-    # avg_iter_time(solver, forces)
+    eps = 0.0  # changing eps from 0.0 might help performance but miss some interactions in neighbor list
+    delta = 0.25  # in units of blob radius
+    offsets, neighbor_list = utils.build_neighbor_list(
+        all_pos, L_arr, r_cut + delta * blob_radius, eps
+    )
 
-    # dists = []
-    # for i in range(colloid_pos.shape[0] // 3):
-    #     test = np.append(sphere_centers.flatten(), colloid_pos[i * 3 : i * 3 + 3])
-    #     test_dist = np.min(sp.distance.pdist(test.reshape(-1, 3)))
-    #     dists.append(test_dist)
-    # print("min dist:", np.min(dists))
+    # spring timescale
+    T_k = 6 * np.pi * eta * blob_radius / k_spring
+    print("spring timescale:", T_k)
+    print("avg displacement:", np.sqrt(kbt / k_spring))
+    # print("D:", kbt / (6 * np.pi * eta * blob_radius))
 
-    # plot_spheres(sphere_centers, sphere_radius, colloid_pos)
+    dt = 1.0e-3 * T_k
+    print("dt:", dt)
 
-    # T_final = 4 * 3600  # in seconds, 4 hours
-    dt = 0.001  # in seconds TODO fix
-    T_final = 100 * dt  # TODO temp
+    T_final = 3600  # in seconds, 1 hour
     n_steps = int(T_final / dt)
     print("n steps:", n_steps)
+    n_save = np.floor(0.5 / dt)  # save every half second
+    print("n save:", n_save)
 
-    steric_time = 0
+    params = {
+        "n_rigid_blobs": n_rigid_blobs,
+        "n_blobs": n_blobs,
+        "blob_radius": blob_radius,
+        "k_spring": k_spring,
+        "U0": U0,
+        "debye": debye,
+        "r_cut": r_cut,
+        "delta": delta,
+        "eps": eps,
+        "n_cutoff": n_cutoff,
+        "dt": dt,
+        "T_final": T_final,
+        "L": Lx,
+        "kbt": kbt,
+        "eta": eta,
+        "sphere_radius": sphere_radius,
+        "n_colloids": n_colloids,
+    }
+
+    utils.save_params_json(params)
+
+    n_out = 500
     for i in range(n_steps):
-        print("step:", i)
+        if i % n_out == 1:
+            with open("log.txt", "a") as f:
+                utils.log(f"step: {i}\n")
+                rigid_drift = np.max(
+                    np.linalg.vector_norm(
+                        all_pos[0:n_rigid_blobs, :] - rigid_blob_x0, axis=1
+                    )
+                )
+                utils.log
+                f.write(f"max rigid drift: {rigid_drift}\n")
+
+        if i % n_save == 0:
+            print("saving colloid pos at step:", i)
+            colloid_pos = all_pos[n_rigid_blobs:, :].flatten()
+            utils.save_pos(colloid_pos, i * dt, fname)
+
+        forces = np.zeros((n_blobs, 3), dtype=precision)
+        spring_force = -k_spring * (all_pos[0:n_rigid_blobs, :] - rigid_blob_x0)
+        forces[0:n_rigid_blobs, :] += spring_force
+
+        sterics = blob_blob_sterics(
+            all_pos,
+            L_arr,
+            blob_radius,
+            U0,
+            debye,
+            neighbor_list,
+            offsets,
+            n_rigid_blobs,
+        )
+        forces += sterics
+
         solver.setPositions(all_pos)
-
-        forces = np.zeros((n_blobs * 3), dtype=precision)
-        forces[0 : 3 * n_rigid_blobs] += -k_spring * (
-            all_pos[0 : 3 * n_rigid_blobs] - rigid_blob_x0
-        )
-
-        start = time.time()
-        forces += blob_blob_force_numba(
-            L_arr, blob_radius, all_pos, U0, debye, n_rigid_blobs, precision
-        ).flatten()
-        end = time.time()
-        steric_time += end - start
-
-        # (I think I can use an Euler-Maryama and hydrodynamicVelocities, check PSE paper)
         v, _ = solver.hydrodynamicVelocities(forces)
-        all_pos += dt * v.flatten()
+        all_pos += dt * v
 
-        print(
-            np.max(rigid_blob_x0 - all_pos[0 : 3 * n_rigid_blobs]),
-            np.min(rigid_blob_x0 - all_pos[0 : 3 * n_rigid_blobs]),
-        )
-        # print(np.max(all_pos), np.min(all_pos))
+        if np.max(dt * v) > 0.25 * blob_radius:
+            print("dt maybe too large, decrease dt")
+            # break
 
-        # if i % 100 == 0:
-        #     plot_spheres(sphere_centers, sphere_radius, all_pos)
+        max_delta_pos = np.max(np.linalg.vector_norm(all_pos - x0, axis=1))
+        if max_delta_pos > delta * blob_radius:
+            print("rebuilding neighbor list")
+            offsets, neighbor_list = utils.build_neighbor_list(
+                all_pos, L_arr, r_cut + delta * blob_radius, eps
+            )
+            x0 = all_pos.copy()
 
-    print("average steric time:", steric_time / n_steps)
-    print("total time:", steric_time)
 
-
-########## version using symmetry and ignoring rigid-rigid interactions
 @njit(parallel=True, fastmath=True)
-def blob_blob_force_numba(
-    L, a, r_vectors, repulsion_strength, debye_length, n_exclude, precision
+def blob_blob_sterics(
+    r_vectors,
+    L,
+    a,
+    repulsion_strength,
+    debye_length,
+    list_of_neighbors,
+    offsets,
+    n_exclude,
 ):
     """
-    This function compute the force between two blobs
-    with vector between blob centers r.
-
-    In this example the force is derived from the potential
+    The force is derived from the potential
 
     U(r) = U0 + U0 * (2*a-r)/b   if z<2*a
-    U(r) = U0 * exp(-(r-2*a)/b)  if z>=2*a
+    U(r) = U0 * exp(-(r-2*a)/b)  iz z>=2*a
 
     with
     eps = potential strength
     r_norm = distance between blobs
     b = Debye length
     a = blob_radius
-    n_exclude = number of blobs to skip sterics on.
-      This is useful when using rigid multiblobs to not include steric interactions between
-      those particles, but requires them to be at the beginning of the r_vectors array.
     """
 
     N = r_vectors.size // 3
     r_vectors = r_vectors.reshape((N, 3))
-    force = np.zeros((N, 3)).astype(precision)
+    force = np.zeros((N, 3))
 
     for i in prange(N):
-        # this logic skips rigid-rigid interactions and self-interactions (i=j)
-        # the goal is to only include rigid-colloid and colloid-colloid interactions
-        if i < n_exclude:
-            j_start = n_exclude
-        else:  # start above i since (i,j) = -(j,i) which is included below
-            j_start = i + 1
-
-        for j in range(j_start, N):
+        for kk in range(offsets[i + 1] - offsets[i]):
+            j = list_of_neighbors[offsets[i] + kk]
+            if i == j:
+                continue
+            if i < n_exclude and j < n_exclude:  # skip rigid-rigid interactions
+                continue
 
             dr = np.zeros(3)
             for k in range(3):
@@ -140,29 +194,31 @@ def blob_blob_force_numba(
 
             # Compute force
             r_norm = np.sqrt(dr[0] * dr[0] + dr[1] * dr[1] + dr[2] * dr[2])
-            #   r_hat = dr/r_norm
 
-            offset = 2.0 * a
-            if r_norm > offset:
-                coeff = (
-                    -(repulsion_strength / debye_length)
-                    * np.exp(-(r_norm - offset) / debye_length)
-                    / np.maximum(r_norm, 1.0e-16)
-                )
-            else:
-                coeff = -(repulsion_strength / debye_length) / np.maximum(
-                    r_norm, 1.0e-16
-                )
-
-            iter_force = coeff * dr
-
-            force[i] += iter_force
-            force[j] -= iter_force
+            for k in range(3):
+                offset = 2.0 * a
+                if r_norm > (offset):
+                    force[i, k] += (
+                        -(
+                            (repulsion_strength / debye_length)
+                            * np.exp(-(r_norm - (offset)) / debye_length)
+                            / np.maximum(r_norm, 1.0e-12)
+                        )
+                        * dr[k]
+                    )
+                else:
+                    force[i, k] += (
+                        -(
+                            (repulsion_strength / debye_length)
+                            / np.maximum(r_norm, 1.0e-12)
+                        )
+                        * dr[k]
+                    )
 
     return force
 
 
-def plot_spheres(sphere_centers, sphere_radius, colloid_pos=None):
+def plot_spheres(sphere_centers, sphere_radius, colloid_pos=None, fname=None):
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
     ax.set_box_aspect([1, 1, 1])
@@ -171,7 +227,6 @@ def plot_spheres(sphere_centers, sphere_radius, colloid_pos=None):
         x = sphere_centers[i][0]
         y = sphere_centers[i][1]
         z = sphere_centers[i][2]
-        # Generate a sphere using parametric equations
         u = np.linspace(0, 2 * np.pi, 20)
         v = np.linspace(0, np.pi, 20)
         x = sphere_radius * np.outer(np.cos(u), np.sin(v)) + x
@@ -188,7 +243,8 @@ def plot_spheres(sphere_centers, sphere_radius, colloid_pos=None):
             alpha=0.5,
         )
 
-    plt.show()
+    plt.savefig(fname)
+    plt.close(fig)
 
 
 def avg_iter_time(solver, forces):
@@ -205,9 +261,7 @@ def avg_iter_time(solver, forces):
 
 
 def place_colloids(sphere_centers, sphere_radius, blob_radius, L, n_colloids):
-    kd_box = [L, L, L]  # basically not periodic in the last dim
-    print(np.max(sphere_centers, axis=0))
-    print(np.min(sphere_centers, axis=0))
+    kd_box = [L, L, L]
     kd = sp.KDTree(
         data=sphere_centers,
         copy_data=True,
@@ -220,7 +274,7 @@ def place_colloids(sphere_centers, sphere_radius, blob_radius, L, n_colloids):
         rand_pos = (np.random.rand(3)) * L
         pts = kd.query_ball_point(
             rand_pos,
-            sphere_radius + 2.5 * blob_radius,
+            sphere_radius + 3 * blob_radius,
             p=2,
         )
         if len(pts) > 0:
@@ -232,10 +286,10 @@ def place_colloids(sphere_centers, sphere_radius, blob_radius, L, n_colloids):
     return colloid_pos.flatten()
 
 
-def make_spheres(sphere_radius):
+def make_spheres(sphere_radius, infile):
     sphere_diam = 2 * sphere_radius
 
-    dat = np.fromfile("dat/small.xyzd")
+    dat = np.fromfile(infile)
     n_spheres = len(dat) // 4
 
     sphere_centers = np.array([dat[i] for i in range(len(dat)) if i % 4 != 3])
